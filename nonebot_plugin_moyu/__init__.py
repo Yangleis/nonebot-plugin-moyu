@@ -1,11 +1,13 @@
+import datetime
+import os
 import re
 from pathlib import Path
 
 import httpx
+from aiofiles import open
 from nonebot import get_bot, get_driver, logger, on_command
 from nonebot.adapters import Message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageSegment
-from nonebot.matcher import Matcher
 from nonebot.params import Arg, CommandArg
 from nonebot.typing import T_State
 from nonebot_plugin_apscheduler import scheduler
@@ -15,7 +17,9 @@ try:
 except ModuleNotFoundError:
     import json
 
-subscribe = Path(__file__).parent / "subscribe.json"
+
+data_path = Path("data/moyu")
+subscribe = data_path / "subscribe.json"
 
 subscribe_list = json.loads(subscribe.read_text("utf-8")) if subscribe.is_file() else {}
 
@@ -27,13 +31,31 @@ def save_subscribe():
 driver = get_driver()
 
 
-async def get_calendar() -> str:
-    async with httpx.AsyncClient(http2=True) as client:
-        response = await client.get("https://api.j4u.ink/v1/store/other/proxy/remote/moyu.json")
-    if response.is_error:
-        raise ValueError(f"摸鱼日历获取失败，错误码：{response.status_code}")
-    content = response.json()
-    return content["data"]["moyu_url"]
+async def get_calendar() -> Path:
+    data_path = Path("data/moyu")
+    today = datetime.date.today()
+    moyu_file = data_path / f"{today.strftime('%Y%m%d')}.png"
+    if not moyu_file.exists():
+        async with httpx.AsyncClient(http2=True) as client:
+            response = await client.get("https://api.j4u.ink/v1/store/other/proxy/remote/moyu.json")
+            if response.is_error:
+                raise ValueError(f"摸鱼链接获取失败，错误码：{response.status_code}")
+            moyu_url = response.json()["data"]["moyu_url"]
+            moyu_file = data_path / Path(moyu_url).name
+            if moyu_file.exists():
+                return moyu_file
+            else:
+                yesterday = today + datetime.timedelta(-1)
+                yesterday_moyu_file = data_path / f"{yesterday.strftime('%Y%m%d')}.png"
+                if yesterday_moyu_file.exists():
+                    os.remove(yesterday_moyu_file)
+                logger.info(f"开始下载摸鱼图片[{moyu_url}]")
+                response = await client.get(moyu_url, follow_redirects=True)
+                if response.is_error:
+                    raise ValueError(f"摸鱼图片下载失败，错误码：{response.status_code}")
+                async with open(moyu_file, "wb") as fp:
+                    await fp.write(response.content)
+    return moyu_file
 
 
 @driver.on_startup
@@ -52,9 +74,9 @@ async def subscribe_jobs():
 
 async def push_calendar(group_id: str):
     bot = get_bot()
-    moyu_img = await get_calendar()
+    moyu_file = await get_calendar()
     await bot.send_group_msg(
-        group_id=int(group_id), message=MessageSegment.image(moyu_img)
+        group_id=int(group_id), message=MessageSegment.image(moyu_file)
     )
 
 
@@ -78,7 +100,7 @@ moyu_matcher = on_command("摸鱼日历", aliases={"摸鱼"})
 
 @moyu_matcher.handle()
 async def moyu(
-    event: GroupMessageEvent, matcher: Matcher, args: Message = CommandArg()
+    event: GroupMessageEvent, args: Message = CommandArg()
 ):
     if cmdarg := args.extract_plain_text():
         if "状态" in cmdarg:
@@ -89,20 +111,20 @@ async def moyu(
                 moyu_state += (
                     f"\n推送时间: {group_id_info['hour']}:{group_id_info['minute']}"
                 )
-            await matcher.finish(moyu_state)
+            await moyu_matcher.finish(moyu_state)
         elif "设置" in cmdarg or "推送" in cmdarg:
             if ":" in cmdarg or "：" in cmdarg:
-                matcher.set_arg("time_arg", args)
+                moyu_matcher.set_arg("time_arg", args)
         elif "禁用" in cmdarg or "关闭" in cmdarg:
             del subscribe_list[str(event.group_id)]
             save_subscribe()
             scheduler.remove_job(f"moyu_calendar_{event.group_id}")
-            await matcher.finish("摸鱼日历推送已禁用")
+            await moyu_matcher.finish("摸鱼日历推送已禁用")
         else:
-            await matcher.finish("摸鱼日历的参数不正确")
+            await moyu_matcher.finish("摸鱼日历的参数不正确")
     else:
-        moyu_img = await get_calendar()
-        await matcher.finish(MessageSegment.image(moyu_img))
+        moyu_file = await get_calendar()
+        await moyu_matcher.finish(MessageSegment.image(moyu_file))
 
 
 @moyu_matcher.got("time_arg", prompt="请发送每日定时推送日历的时间，格式为：小时:分钟")
